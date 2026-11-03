@@ -39,7 +39,9 @@ The server runs on Vercel's Go runtime as a stateless Streamable HTTP MCP endpoi
    |---|---|
    | `FBP_AUTH_TOKEN` | A random secret of at least 24 characters, e.g. `openssl rand -hex 32`. Every MCP request must send `Authorization: Bearer <it>`. |
    | `FB_APP_ID`, `FB_APP_SECRET` | From the Meta app |
-   | `FB_USER_TOKEN` | User token from Graph API Explorer |
+   | `FB_USER_TOKEN` | Optional. A user token from Graph API Explorer, imported as one account. Prefer connecting accounts at `/connect` |
+   | `FB_LOGIN_CONFIG_ID` | Optional. The Facebook Login for Business configuration ID, when the app requires one instead of `scope` |
+   | `FBP_PUBLIC_URL` | Optional. The public origin, e.g. `https://page-post-pi.vercel.app`; defaults to Vercel's production URL |
    | `FB_GRAPH_VERSION` | Optional; default `v23.0` |
    | `FBP_OWNER_NAME`, `FBP_CONTACT_EMAIL` | Owner name and contact email shown on `/privacy` and `/data-deletion` |
 
@@ -52,7 +54,22 @@ The server runs on Vercel's Go runtime as a stateless Streamable HTTP MCP endpoi
      "headers": {"Authorization": "Bearer ${FBP_AUTH_TOKEN}"}
    }}}
    ```
-6. Run `fbp_refresh_pages` once. The long-lived user token and the Page tokens are then stored in Redis. If you later replace `FB_USER_TOKEN`, the stored long-lived token is ignored until you run `fbp_refresh_pages` again.
+6. Connect Facebook accounts at `https://<project>.vercel.app/connect` (see below). Alternatively, set `FB_USER_TOKEN` and run `fbp_refresh_pages`.
+
+## Accounts
+
+The server can manage the Pages of several Facebook accounts, for example one account for bamboo goods and another for real estate. All of their Pages appear together in `fbp_list_pages`, each tagged with its `account_id` and `account_name`, and a post goes out with the token of the Page it targets.
+
+To add an account:
+
+1. In the Meta app, add the **Facebook Login** product (**Facebook Login for Business** for Business apps). Under its settings, add `https://<project>.vercel.app/oauth/callback` to **Valid OAuth Redirect URIs**. The `/connect` page shows the exact URI to add.
+2. If the app requires a Login configuration, create one with the five permissions and set its ID as `FB_LOGIN_CONFIG_ID`.
+3. Make sure the Facebook account has a role on the app (Admin, Developer or Tester) and permission to create content on its Pages.
+4. In a browser logged in to that Facebook account, open `/connect` and sign in with `FBP_AUTH_TOKEN`. Press **Kết nối Facebook**, approve the permissions and select every Page.
+
+The server then exchanges the code for a long-lived token and stores the account and a Page token for each Page in Redis.
+
+Removing an account (on `/connect` or with `fbp_remove_account`) forgets its token and its Pages. Tokens are never shown on the page or returned by tools.
 
 Hosted-mode differences:
 
@@ -65,7 +82,8 @@ Hosted-mode differences:
 | Tool | What it does |
 |---|---|
 | `fbp_status` | Config, token validity, expiry and scopes, and stored Pages; clears a write stop |
-| `fbp_refresh_pages` / `fbp_list_pages` | Fetch and store Page tokens / list the stored Pages |
+| `fbp_list_accounts` / `fbp_remove_account` | Connected Facebook accounts / disconnect one |
+| `fbp_refresh_pages` / `fbp_list_pages` | Reload Page tokens for all or one account / list the stored Pages, optionally per account |
 | `fbp_get_page` | Page profile and follower count |
 | `fbp_get_posts` / `fbp_get_scheduled_posts` / `fbp_get_post` | Published posts with counts / scheduled posts / one post |
 | `fbp_get_comments` | Comments on a post, or replies to a comment |

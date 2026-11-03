@@ -34,11 +34,12 @@ func strList(desc string) map[string]any {
 }
 
 var (
-	pageIDProp  = strProp("numeric Page ID (from fbp_list_pages)")
-	postIDProp  = strProp("post ID as returned by Graph, usually <page_id>_<post_id>")
-	cursorProp  = strProp("next_cursor from the previous page; omit for the first page")
-	limitProp   = intProp("items per page, default 10", 0, 100)
-	messageProp = strProp("text; line breaks are kept")
+	pageIDProp    = strProp("numeric Page ID (from fbp_list_pages)")
+	accountIDProp = strProp("optional: only this account (id from fbp_list_accounts)")
+	postIDProp    = strProp("post ID as returned by Graph, usually <page_id>_<post_id>")
+	cursorProp    = strProp("next_cursor from the previous page; omit for the first page")
+	limitProp     = intProp("items per page, default 10", 0, 100)
+	messageProp   = strProp("text; line breaks are kept")
 )
 
 // Fields read for a published post; counts come back as summaries only.
@@ -53,21 +54,33 @@ var tools = []tool{
 	// --- setup & pages
 	{
 		Name:        "fbp_status",
-		Description: "Check the Graph API configuration: config file, user token validity, expiry and scopes, and the stored Pages; also clears a write stop once the token is valid",
+		Description: "Check the setup: app config, each connected Facebook account's token validity, expiry and scopes, and Page counts; also clears a write stop once every token is valid",
 		Schema:      objectSchema(map[string]any{}),
 		Run:         runStatus,
 	},
 	{
-		Name:        "fbp_refresh_pages",
-		Description: "Exchange the user token for a long-lived one (when app_secret is set) and store a Page token for every Page the user manages; run after setup or when a Page is added",
+		Name:        "fbp_list_accounts",
+		Description: "List the connected Facebook accounts (no tokens) with how many Pages each manages; new accounts are added in a browser at <server>/connect",
 		Schema:      objectSchema(map[string]any{}),
+		Run:         runListAccounts,
+	},
+	{
+		Name:        "fbp_refresh_pages",
+		Description: "Reload the Pages and Page tokens of every connected account (or one); run when a Page was added or a role changed",
+		Schema:      objectSchema(map[string]any{"account_id": accountIDProp}),
 		Run:         runRefreshPages,
 	},
 	{
 		Name:        "fbp_list_pages",
-		Description: "List the stored Pages the user manages (no tokens)",
-		Schema:      objectSchema(map[string]any{}),
+		Description: "List the stored Pages (no tokens), each with the account it belongs to; optionally only one account's Pages",
+		Schema:      objectSchema(map[string]any{"account_id": accountIDProp}),
 		Run:         runListPages,
+	},
+	{
+		Name:        "fbp_remove_account",
+		Description: "Disconnect a Facebook account: forget its token and all of its Pages on this server (reconnect at <server>/connect)",
+		Schema:      objectSchema(map[string]any{"account_id": strProp("account id from fbp_list_accounts")}, "account_id"),
+		Run:         runRemoveAccount,
 	},
 	{
 		Name:        "fbp_get_page",
@@ -252,6 +265,9 @@ func runStatus(ctx context.Context, s *server, raw json.RawMessage) (any, error)
 		return nil, err
 	}
 	out := map[string]any{"storage": s.store.b.locations(), "hosted": s.remote}
+	if s.remote {
+		out["connect_url"] = s.publicURL(nil) + "/connect"
+	}
 	t := s.trip()
 	if t != nil {
 		out["write_stop"] = t
@@ -259,7 +275,7 @@ func runStatus(ctx context.Context, s *server, raw json.RawMessage) (any, error)
 	c, err := s.prepare()
 	if err != nil {
 		out["config_error"] = err
-		out["setup_hint"] = "create a Meta app (type Business) at developers.facebook.com, generate a user token in Graph API Explorer with pages_show_list, pages_read_engagement, pages_manage_posts, pages_manage_engagement and read_insights, put it in the config (file locally, FB_USER_TOKEN on Vercel), then run fbp_refresh_pages"
+		out["setup_hint"] = "create a Meta app (type Business), set its app id and secret, then connect accounts at /connect (hosted) or put a user token in the config (local) and run fbp_refresh_pages"
 		return out, nil
 	}
 	s.gr.mu.Lock()
@@ -267,26 +283,38 @@ func runStatus(ctx context.Context, s *server, raw json.RawMessage) (any, error)
 	s.gr.mu.Unlock()
 	out["app_configured"] = c.AppID != "" && c.AppSecret != ""
 
-	me, err := s.gr.call(ctx, "GET", "me", c.UserToken, url.Values{"fields": {"id,name"}})
+	as, err := s.store.accounts()
 	if err != nil {
-		out["token_error"] = s.noteError(err)
+		out["accounts_error"] = err
 		return out, nil
 	}
-	out["account"] = map[string]any{"id": str(me["id"]), "name": str(me["name"])}
-	if info := s.tokenInfo(ctx, c); info != nil {
-		out["user_token"] = info
-	}
-	if pf, err := s.store.pages(); err != nil {
-		out["pages_error"] = err
-	} else {
+	counts := map[string]int{}
+	if pf, err := s.store.pages(); err == nil {
 		out["pages_refreshed_at"] = pf.RefreshedAt
-		pub := make([]publicPage, 0, len(pf.Pages))
+		out["pages_total"] = len(pf.Pages)
 		for _, p := range pf.Pages {
-			pub = append(pub, p.public())
+			counts[p.AccountID]++
 		}
-		out["pages"] = pub
 	}
-	if t != nil {
+	healthy := len(as) > 0
+	list := make([]map[string]any, 0, len(as))
+	for _, a := range as {
+		row := map[string]any{"id": a.ID, "name": a.Name, "label": a.Label, "source": a.Source, "pages": counts[a.ID]}
+		if _, err := s.gr.call(ctx, "GET", "me", a.Token, url.Values{"fields": {"id"}}); err != nil {
+			row["token_error"] = err
+			healthy = false
+		} else if info := s.tokenInfo(ctx, c, a.Token); info != nil {
+			row["token"] = info
+		}
+		list = append(list, row)
+	}
+	out["accounts"] = list
+	if len(as) == 0 && c.UserToken != "" {
+		out["hint"] = "a user token is configured but not imported yet; run fbp_refresh_pages"
+	} else if len(as) == 0 {
+		out["hint"] = "no Facebook account connected yet"
+	}
+	if t != nil && healthy {
 		s.setTrip(nil)
 		out["write_stop_cleared"] = t.Code
 		delete(out, "write_stop")
@@ -294,31 +322,65 @@ func runStatus(ctx context.Context, s *server, raw json.RawMessage) (any, error)
 	return out, nil
 }
 
-func runRefreshPages(ctx context.Context, s *server, raw json.RawMessage) (any, error) {
+func runListAccounts(ctx context.Context, s *server, raw json.RawMessage) (any, error) {
 	if err := decodeArgs(raw, &struct{}{}); err != nil {
+		return nil, err
+	}
+	accs, err := s.store.publicAccounts()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]any{"count": len(accs), "accounts": accs}
+	if s.remote {
+		out["connect_url"] = s.publicURL(nil) + "/connect"
+	}
+	return out, nil
+}
+
+func runRefreshPages(ctx context.Context, s *server, raw json.RawMessage) (any, error) {
+	var in struct {
+		AccountID string `json:"account_id"`
+	}
+	if err := decodeArgs(raw, &in); err != nil {
 		return nil, err
 	}
 	c, err := s.prepare()
 	if err != nil {
 		return nil, err
 	}
-	out, err := s.refreshPages(ctx, c)
+	out, err := s.refreshPages(ctx, c, in.AccountID)
 	return out, s.noteError(err)
 }
 
 func runListPages(ctx context.Context, s *server, raw json.RawMessage) (any, error) {
-	if err := decodeArgs(raw, &struct{}{}); err != nil {
+	var in struct {
+		AccountID string `json:"account_id"`
+	}
+	if err := decodeArgs(raw, &in); err != nil {
 		return nil, err
 	}
 	pf, err := s.store.pages()
 	if err != nil {
 		return nil, err
 	}
-	pub := make([]publicPage, 0, len(pf.Pages))
-	for _, p := range pf.Pages {
-		pub = append(pub, p.public())
-	}
+	pub := publicPages(pf.Pages, in.AccountID)
 	return map[string]any{"refreshed_at": pf.RefreshedAt, "count": len(pub), "pages": pub}, nil
+}
+
+func runRemoveAccount(ctx context.Context, s *server, raw json.RawMessage) (any, error) {
+	var in struct {
+		AccountID string `json:"account_id"`
+	}
+	if err := decodeArgs(raw, &in); err != nil {
+		return nil, err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	a, n, err := s.store.removeAccount(in.AccountID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"removed": a.Name, "account_id": a.ID, "pages_removed": n}, nil
 }
 
 func runGetPage(ctx context.Context, s *server, raw json.RawMessage) (any, error) {

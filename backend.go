@@ -24,27 +24,30 @@ type backend interface {
 	saveUserToken(token string) error
 	loadPages() ([]byte, error) // nil when nothing is stored yet
 	savePages(b []byte) error
+	loadAccounts() ([]byte, error) // nil when no account is connected
+	saveAccounts(b []byte) error
 	appendHistory(line []byte) error
 	historyLines() ([][]byte, error) // oldest first
 	loadTrip() ([]byte, error)
 	saveTrip(b []byte) error // nil clears the stop
 	locations() map[string]string
-	deleteAll() error // tokens, Pages, history and the write stop
+	deleteAll() error // accounts, tokens, Pages, history and the write stop
 }
 
 // --- local files
 
 type fileBackend struct {
-	configPath, pagesPath, historyPath, tripPath string
-	mu                                           sync.Mutex
+	configPath, pagesPath, accountsPath, historyPath, tripPath string
+	mu                                                         sync.Mutex
 }
 
 func newFileBackend(dir, configPath string) *fileBackend {
 	return &fileBackend{
-		configPath:  expandHome(configPath),
-		pagesPath:   filepath.Join(dir, "pages.json"),
-		historyPath: filepath.Join(dir, "page-history.jsonl"),
-		tripPath:    filepath.Join(dir, "page-write-stop.json"),
+		configPath:   expandHome(configPath),
+		pagesPath:    filepath.Join(dir, "pages.json"),
+		accountsPath: filepath.Join(dir, "page-accounts.json"),
+		historyPath:  filepath.Join(dir, "page-history.jsonl"),
+		tripPath:     filepath.Join(dir, "page-write-stop.json"),
 	}
 }
 
@@ -87,9 +90,11 @@ func (f *fileBackend) saveUserToken(token string) error {
 	return writePrivate(f.configPath, append(out, '\n'))
 }
 
-func (f *fileBackend) loadPages() ([]byte, error) { return readOptional(f.pagesPath) }
-func (f *fileBackend) savePages(b []byte) error   { return writePrivate(f.pagesPath, b) }
-func (f *fileBackend) loadTrip() ([]byte, error)  { return readOptional(f.tripPath) }
+func (f *fileBackend) loadPages() ([]byte, error)    { return readOptional(f.pagesPath) }
+func (f *fileBackend) savePages(b []byte) error      { return writePrivate(f.pagesPath, b) }
+func (f *fileBackend) loadTrip() ([]byte, error)     { return readOptional(f.tripPath) }
+func (f *fileBackend) loadAccounts() ([]byte, error) { return readOptional(f.accountsPath) }
+func (f *fileBackend) saveAccounts(b []byte) error   { return writePrivate(f.accountsPath, b) }
 
 func (f *fileBackend) saveTrip(b []byte) error {
 	if b == nil {
@@ -134,7 +139,7 @@ func (f *fileBackend) historyLines() ([][]byte, error) {
 
 func (f *fileBackend) deleteAll() error {
 	f.mu.Lock()
-	for _, p := range []string{f.pagesPath, f.historyPath, f.tripPath} {
+	for _, p := range []string{f.pagesPath, f.accountsPath, f.historyPath, f.tripPath} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			f.mu.Unlock()
 			return err
@@ -209,7 +214,7 @@ func redisFromEnv(env func(string) string) *redisBackend {
 }
 
 func (r *redisBackend) locations() map[string]string {
-	return map[string]string{"kind": "upstash_redis", "key_prefix": r.prefix, "config": "environment variables FB_APP_ID, FB_APP_SECRET, FB_USER_TOKEN"}
+	return map[string]string{"kind": "upstash_redis", "key_prefix": r.prefix, "config": "environment variables FB_APP_ID, FB_APP_SECRET (FB_USER_TOKEN optional)"}
 }
 
 // cmd runs one Redis command; the result is nil for a missing key.
@@ -265,8 +270,11 @@ type storedToken struct {
 
 func (r *redisBackend) loadConfig() (config, error) {
 	c := config{AppID: r.env("FB_APP_ID"), AppSecret: r.env("FB_APP_SECRET"), UserToken: r.env("FB_USER_TOKEN"), GraphVersion: r.env("FB_GRAPH_VERSION")}
+	if strings.TrimSpace(c.AppID) == "" || strings.TrimSpace(c.AppSecret) == "" {
+		return c, errf("not_configured", "set FB_APP_ID and FB_APP_SECRET in the Vercel project's environment variables, then redeploy")
+	}
 	if strings.TrimSpace(c.UserToken) == "" {
-		return c, errf("not_configured", "set FB_USER_TOKEN (and FB_APP_ID, FB_APP_SECRET) in the Vercel project's environment variables, then redeploy")
+		return c, nil // accounts connect through /connect instead
 	}
 	b, err := r.get("user_token")
 	if err != nil {
@@ -284,9 +292,11 @@ func (r *redisBackend) saveUserToken(token string) error {
 	return r.set("user_token", b)
 }
 
-func (r *redisBackend) loadPages() ([]byte, error) { return r.get("pages") }
-func (r *redisBackend) savePages(b []byte) error   { return r.set("pages", b) }
-func (r *redisBackend) loadTrip() ([]byte, error)  { return r.get("write_stop") }
+func (r *redisBackend) loadPages() ([]byte, error)    { return r.get("pages") }
+func (r *redisBackend) savePages(b []byte) error      { return r.set("pages", b) }
+func (r *redisBackend) loadTrip() ([]byte, error)     { return r.get("write_stop") }
+func (r *redisBackend) loadAccounts() ([]byte, error) { return r.get("accounts") }
+func (r *redisBackend) saveAccounts(b []byte) error   { return r.set("accounts", b) }
 
 func (r *redisBackend) saveTrip(b []byte) error {
 	if b == nil {
@@ -305,7 +315,7 @@ func (r *redisBackend) appendHistory(line []byte) error {
 }
 
 func (r *redisBackend) deleteAll() error {
-	_, err := r.cmd("DEL", r.prefix+"user_token", r.prefix+"pages", r.prefix+"history", r.prefix+"write_stop")
+	_, err := r.cmd("DEL", r.prefix+"user_token", r.prefix+"accounts", r.prefix+"pages", r.prefix+"history", r.prefix+"write_stop")
 	return err
 }
 

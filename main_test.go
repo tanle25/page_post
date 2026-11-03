@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,11 +45,23 @@ func (f *fakeGraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case path == "/oauth/access_token" && r.Form.Get("code") != "":
+		if r.Form.Get("code") != "GOODCODE" || !strings.HasSuffix(r.Form.Get("redirect_uri"), "/oauth/callback") {
+			http.Error(w, `{"error":{"message":"bad code","code":100}}`, 400)
+			return
+		}
+		fmt.Fprint(w, `{"access_token":"OAUTH-SHORT","token_type":"bearer"}`)
+	case path == "/oauth/access_token" && r.Form.Get("fb_exchange_token") == "OAUTH-SHORT":
+		fmt.Fprint(w, `{"access_token":"LONG-BDS","token_type":"bearer"}`)
 	case path == "/oauth/access_token":
 		fmt.Fprint(w, `{"access_token":"LONG-USER","token_type":"bearer"}`)
 	case path == "/me" && tok == "LONG-USER":
 		fmt.Fprint(w, `{"id":"42","name":"Tester"}`)
-	case path == "/me/accounts":
+	case path == "/me" && tok == "LONG-BDS":
+		fmt.Fprint(w, `{"id":"43","name":"Chủ Nhà Đất"}`)
+	case path == "/me/accounts" && tok == "LONG-BDS":
+		fmt.Fprint(w, `{"data":[{"id":"888","name":"Nhà Đất Thanh Hóa","category":"Real Estate","tasks":["CREATE_CONTENT"],"access_token":"PAGE-BDS"}]}`)
+	case path == "/me/accounts" && tok == "LONG-USER":
 		fmt.Fprint(w, `{"data":[{"id":"777","name":"Tre Shop","category":"Shopping","tasks":["CREATE_CONTENT"],"access_token":"PAGE-TOKEN"}],"paging":{"cursors":{"after":"x"}}}`)
 	case path == "/777/photos" && tok == "PAGE-TOKEN":
 		hasFile := r.MultipartForm != nil && len(r.MultipartForm.File["source"]) == 1
@@ -228,7 +242,7 @@ func TestToolSchemasAreValid(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(tools) != 18 {
+	if len(tools) != 20 {
 		t.Fatalf("got %d tools", len(tools))
 	}
 }
@@ -395,5 +409,100 @@ func TestHTTPTransport(t *testing.T) {
 		if g.StatusCode != 200 || !strings.Contains(string(b), "lienhe@example.com") || !strings.Contains(string(b), "Tre Shop") {
 			t.Fatalf("%s: %d %s", p, g.StatusCode, b[:min(len(b), 200)])
 		}
+	}
+}
+
+func TestConnectFlow(t *testing.T) {
+	fg := &fakeGraph{}
+	s, _ := hostedServer(t, fg, map[string]string{"FB_APP_ID": "1", "FB_APP_SECRET": "sec"})
+	const secret = "0123456789abcdef0123456789"
+	h := httptest.NewServer(s.httpHandler(secret))
+	defer h.Close()
+	jar, _ := cookiejar.New(nil)
+	cl := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	get := func(path string) (*http.Response, string) {
+		r, err := cl.Get(h.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(r.Body)
+		return r, string(b)
+	}
+	post := func(path string, form url.Values, origin string) *http.Response {
+		req, _ := http.NewRequest("POST", h.URL+path, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		r, err := cl.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+
+	// Without an account there is nothing to refresh, and the hint points at /connect.
+	if _, err := call(t, s, "fbp_refresh_pages", map[string]any{}); err == nil || err.Code != "no_accounts" {
+		t.Fatalf("want no_accounts, got %v", err)
+	}
+	if _, body := get("/oauth/callback?code=GOODCODE&state=x"); !strings.Contains(body, "hết hạn") {
+		t.Fatalf("callback without a session must be refused: %s", body)
+	}
+	if r := post("/connect/login", url.Values{"password": {secret}}, "https://evil.example"); r.StatusCode != 403 {
+		t.Fatalf("cross-site login: %d", r.StatusCode)
+	}
+	if r := post("/connect/login", url.Values{"password": {"wrong"}}, ""); r.StatusCode != 401 {
+		t.Fatalf("wrong password: %d", r.StatusCode)
+	}
+	if r := post("/connect/login", url.Values{"password": {secret}}, ""); r.StatusCode != 303 {
+		t.Fatalf("login: %d", r.StatusCode)
+	}
+
+	r, _ := get("/connect/start?label=" + url.QueryEscape("Bất động sản"))
+	loc, _ := url.Parse(r.Header.Get("Location"))
+	if r.StatusCode != 302 || loc.Host != "www.facebook.com" || loc.Query().Get("client_id") != "1" || !strings.Contains(loc.Query().Get("scope"), "pages_manage_posts") {
+		t.Fatalf("start: %d %s", r.StatusCode, loc)
+	}
+	state := loc.Query().Get("state")
+	if _, body := get("/oauth/callback?code=GOODCODE&state=" + url.QueryEscape(state+"x")); !strings.Contains(body, "không hợp lệ") {
+		t.Fatalf("tampered state accepted: %s", body)
+	}
+	_, body := get("/oauth/callback?code=GOODCODE&state=" + url.QueryEscape(state))
+	if !strings.Contains(body, "Nhà Đất Thanh Hóa") || strings.Contains(body, "LONG-BDS") || strings.Contains(body, "PAGE-BDS") {
+		t.Fatalf("callback page: %s", body)
+	}
+
+	accs, err := call(t, s, "fbp_list_accounts", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := accs["accounts"].([]any)[0].(map[string]any)
+	if accs["count"] != float64(1) || a["label"] != "Bất động sản" || a["pages"] != float64(1) || a["source"] != "oauth" {
+		t.Fatalf("accounts %v", accs)
+	}
+	pages, _ := call(t, s, "fbp_list_pages", map[string]any{"account_id": "43"})
+	if p := pages["pages"].([]any)[0].(map[string]any); p["id"] != "888" || p["account_name"] != "Chủ Nhà Đất" {
+		t.Fatalf("pages %v", pages)
+	}
+	if _, err := call(t, s, "fbp_create_post", map[string]any{"page_id": "888", "message": "x", "image_urls": []string{"https://a.vn/1.jpg"}}); err == nil || err.Code != "token_invalid" {
+		// the fake only knows page 777's endpoints; reaching it with PAGE-BDS proves the right token is used
+		t.Fatalf("want the fake's token_invalid for page 888, got %v", err)
+	}
+	fg.mu.Lock()
+	usedTok := url.Values(fg.forms[len(fg.forms)-1]).Get("access_token")
+	fg.mu.Unlock()
+	if usedTok != "PAGE-BDS" {
+		t.Fatalf("post to page 888 used token %q", usedTok)
+	}
+	s.setTrip(nil)
+
+	if r := post("/connect/remove", url.Values{"account_id": {"43"}}, ""); r.StatusCode != 303 {
+		t.Fatalf("remove: %d", r.StatusCode)
+	}
+	if accs, _ := call(t, s, "fbp_list_accounts", map[string]any{}); accs["count"] != float64(0) {
+		t.Fatalf("account not removed: %v", accs)
+	}
+	if pf, _ := s.store.pages(); len(pf.Pages) != 0 {
+		t.Fatalf("pages not removed: %v", pf.Pages)
 	}
 }

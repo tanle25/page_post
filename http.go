@@ -28,13 +28,14 @@ func (s *server) httpHandler(authToken string) http.Handler {
 	// Public, unauthenticated: Meta links to these from the app settings.
 	mux.HandleFunc("/privacy", servePolicy(privacyTmpl))
 	mux.HandleFunc("/data-deletion", servePolicy(deletionTmpl))
+	s.connectHandlers(mux, authToken)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"name": serverName, "version": serverVersion, "mcp_endpoint": "/api/mcp", "privacy_policy": "/privacy", "data_deletion": "/data-deletion"})
+		json.NewEncoder(w).Encode(map[string]any{"name": serverName, "version": serverVersion, "mcp_endpoint": "/api/mcp", "privacy_policy": "/privacy", "data_deletion": "/data-deletion", "connect": "/connect"})
 	})
 	return mux
 }
