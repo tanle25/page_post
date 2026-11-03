@@ -451,6 +451,20 @@ func TestConnectFlow(t *testing.T) {
 	if r := post("/connect/login", url.Values{"password": {secret}}, "https://evil.example"); r.StatusCode != 403 {
 		t.Fatalf("cross-site login: %d", r.StatusCode)
 	}
+	// What browsers send: Sec-Fetch-Site decides, even with Origin: null.
+	for site, want := range map[string]int{"same-origin": 303, "cross-site": 403, "same-site": 403} {
+		req, _ := http.NewRequest("POST", h.URL+"/connect/login", strings.NewReader(url.Values{"password": {secret}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "null")
+		req.Header.Set("Sec-Fetch-Site", site)
+		r, err := (&http.Client{CheckRedirect: cl.CheckRedirect}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.StatusCode != want {
+			t.Fatalf("Sec-Fetch-Site %s: got %d, want %d", site, r.StatusCode, want)
+		}
+	}
 	if r := post("/connect/login", url.Values{"password": {"wrong"}}, ""); r.StatusCode != 401 {
 		t.Fatalf("wrong password: %d", r.StatusCode)
 	}

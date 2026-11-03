@@ -125,10 +125,15 @@ func (cw *connectWeb) signedIn(r *http.Request) bool {
 	return ok
 }
 
-// sameOrigin rejects cross-site form posts.
+// sameOrigin rejects cross-site form posts. Browsers send Sec-Fetch-Site;
+// Origin is the fallback for older ones and may be "null" under strict
+// referrer policies, so it only counts when it names a real origin.
 func (cw *connectWeb) sameOrigin(r *http.Request) bool {
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" {
+		return site == "same-origin" || site == "none"
+	}
 	o := r.Header.Get("Origin")
-	return o == "" || o == cw.s.publicURL(r)
+	return o == "" || o == "null" || o == cw.s.publicURL(r)
 }
 
 type connectView struct {
@@ -146,7 +151,7 @@ func (cw *connectWeb) render(w http.ResponseWriter, status int, v connectView) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Referrer-Policy", "same-origin")
 	w.WriteHeader(status)
 	if err := connectTmpl.Execute(w, v); err != nil {
 		log.Printf("connect page: %v", err)
