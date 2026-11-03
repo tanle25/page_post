@@ -1,0 +1,10 @@
+# Local state and secrets never belong in the repo.
+page-config.json
+pages.json
+page-history.jsonl
+page-write-stop.json
+*.tmp
+.env*
+.vercel
+/page_post
+/server
