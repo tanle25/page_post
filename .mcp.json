@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "facebook-page": {
+      "type": "http",
+      "url": "https://page-post-pi.vercel.app/api/mcp",
+      "headers": {
+        "Authorization": "Bearer ${FBP_AUTH_TOKEN}"
+      }
+    }
+  }
+}
